@@ -48,6 +48,13 @@ _LOGGER = logging.getLogger(__name__)
 
 DEFAULT_NAME = "BeSmart Thermostat"
 
+# BeSmart state constants
+BESMART_MODE_OFF = "0"
+BESMART_MODE_HEAT = "1"
+BESMART_STATE_OFF = 5
+BESMART_STATE_AUTO = 2
+BESMART_STATE_MANUAL = 3
+
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
     vol.Required(CONF_USERNAME): cv.string,
     vol.Required(CONF_PASSWORD): cv.string,
@@ -215,9 +222,24 @@ class Besmart:
         return None
 
     def setSettings(self, room_name, season):
+        """Set device settings including season mode (ON/OFF).
+        
+        Args:
+            room_name: The room identifier
+            season: "0" for OFF, "1" for HEAT mode
+        """
+        _LOGGER.debug("Setting season to %s for room %s", 
+                     "OFF" if season == BESMART_MODE_OFF else "HEAT",
+                     room_name)
+        
         room = self.roomByTherId(room_name, "casa")
         if self._device and room:
             old_data = self.getSettings(room_name)
+            _LOGGER.debug("Current settings: season=%s, unit=%s, boilerIsOnline=%s",
+                         old_data.get("season") if old_data else None,
+                         old_data.get("unit") if old_data else None,
+                         old_data.get("boilerIsOnline") if old_data else None)
+            
             if old_data and old_data.get("error") == 0:
                 min_ip, min_fp = str(old_data.get("minTempSetPoint", "30.0")).split(".")
                 max_ip, max_fp = str(old_data.get("maxTempSetPoint", "30.0")).split(".")
@@ -279,8 +301,8 @@ class Thermostat(ClimateEntity):
         # Mapping dictionaries
         self.PRESET_HA_TO_BESMART = {"comfort": "2", "eco": "1", "frost": "0"}
         self.PRESET_BESMART_TO_HA = {"2": "comfort", "1": "eco", "0": "frost"}
-        self.HVAC_MODE_HA_BESMART = {HVACMode.HEAT: "1", HVACMode.OFF: "0"}
-        self.HVAC_MODE_BESMART_TO_HA = {"1": HVACMode.HEAT, "0": HVACMode.OFF}
+        self.HVAC_MODE_HA_BESMART = {HVACMode.HEAT: BESMART_MODE_HEAT, HVACMode.OFF: BESMART_MODE_OFF}
+        self.HVAC_MODE_BESMART_TO_HA = {BESMART_MODE_HEAT: HVACMode.HEAT, BESMART_MODE_OFF: HVACMode.OFF}
         self.HVAC_MODE_LIST = [HVACMode.HEAT, HVACMode.OFF]
         self.PRESET_MODE_LIST = ["comfort", "eco", "frost"]
     
@@ -322,13 +344,11 @@ class Thermostat(ClimateEntity):
 
     @property
     def hvac_mode(self):
-        return self.HVAC_MODE_BESMART_TO_HA.get(self._season, HVACMode.OFF)
+        return self._hvac_mode
 
     @property
     def hvac_action(self):
-        if self._heating_state:
-            return HVACAction.HEATING if self.hvac_mode == HVACMode.HEAT else HVACAction.COOLING
-        return HVACAction.OFF
+        return self._hvac_action
 
     @property
     def preset_mode(self):
@@ -353,9 +373,6 @@ class Thermostat(ClimateEntity):
 
         if temperature is not None:
             self._besmart.setRoomConfortTemp(self._room_name, temperature)
-
-        if temperature is not None:
-            self._besmart.setRoomConfortTemp(self._room_name, temperature)
             self._target_temp = temperature  # ← aggiorna lo stato interno
 
 
@@ -369,8 +386,13 @@ class Thermostat(ClimateEntity):
 
     def set_hvac_mode(self, hvac_mode):
         mode = self.HVAC_MODE_HA_BESMART.get(hvac_mode)
-        self._besmart.setSettings(self._room_name, mode)
-        _LOGGER.debug("Set hvac_mode: %s (%s)", hvac_mode, mode)
+        result = self._besmart.setSettings(self._room_name, mode)
+        _LOGGER.debug("Set hvac_mode: %s (%s) -> result: %s", hvac_mode, mode, result)
+        if result:
+            # Update internal state immediately
+            self._season = mode
+            # Force an immediate update to refresh all states
+            self.update()
 
     def update(self):
         _LOGGER.debug("🔄 Update called for room: %s", self._room_name)
@@ -413,6 +435,10 @@ class Thermostat(ClimateEntity):
         self._target_temp_high = self._comfT
 
     
+        # 🌡️ Unit and season - update these first
+        self._current_unit = data.get("tempUnit", "0")
+        self._season = data.get("season", "1")
+        
         # 🔥 Heating state
         self._heating_state = data.get("heating") == "1"
     
@@ -422,19 +448,26 @@ class Thermostat(ClimateEntity):
         except (TypeError, ValueError):
             self._current_state = 2
     
-        if self._current_state == 5:
+        # Determine HVAC mode and action based on season and current state
+        # BeSmart states:
+        # - season="0" or current_state=5: device is OFF
+        # - season="1": device is in HEAT mode
+        # - current_state=2: AUTO mode (following schedule)
+        # - current_state=3: MANUAL mode (temporary override)
+        # - heating="1": boiler is actively heating
+        if self._season == BESMART_MODE_OFF or self._current_state == BESMART_STATE_OFF:
             self._hvac_mode = HVACMode.OFF
             self._hvac_action = HVACAction.OFF
-        elif self._current_state == 1:
-            self._hvac_mode = HVACMode.HEAT
-            self._hvac_action = HVACAction.HEATING if self._heating_state else HVACAction.IDLE
         else:
             self._hvac_mode = HVACMode.HEAT
-            self._hvac_action = HVACAction.IDLE
-    
-        # 🌡️ Unit and season
-        self._current_unit = data.get("tempUnit", "0")
-        self._season = data.get("season", "1")
+            if self._heating_state:
+                self._hvac_action = HVACAction.HEATING
+            else:
+                self._hvac_action = HVACAction.IDLE
+        
+        _LOGGER.debug("State update: season=%s, current_state=%s, heating=%s -> hvac_mode=%s, hvac_action=%s",
+                     self._season, self._current_state, self._heating_state, 
+                     self._hvac_mode, self._hvac_action)
     
         # 🧊 Preset mode mapping
         if self._tempSetMark == "1":
@@ -446,8 +479,9 @@ class Thermostat(ClimateEntity):
         else:
             self._preset_mode = "comfort"
     
-        _LOGGER.debug("✅ Update complete: tempNow=%.1f, tempOut=%.1f, hvac_mode=%s, preset=%s",
-                      self._current_temperature, self._temp_outdoor, self._hvac_mode, self._preset_mode)
+        _LOGGER.debug("✅ Update complete: tempNow=%.1f, tempOut=%.1f, hvac_mode=%s, hvac_action=%s, preset=%s, season=%s, current_state=%s, heating=%s",
+                      self._current_temperature, self._temp_outdoor, self._hvac_mode, self._hvac_action,
+                      self._preset_mode, self._season, self._current_state, self._heating_state)
 
     @property
     def extra_state_attributes(self):
