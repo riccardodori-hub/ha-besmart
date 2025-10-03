@@ -33,10 +33,12 @@ from .const import DOMAIN
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback):
     """Set up BeSmart climate entity from a config entry."""
+    username = entry.data.get("username")
+    password = entry.data.get("password")
     ther_id = entry.data.get("ther_id")
     room_name = entry.data.get("room_name", "casa")
 
-    besmart = Besmart(username="riccardodori", password="Ricky.Smart")
+    besmart = Besmart(username, password)
     besmart.login()
     room = besmart.roomByTherId(ther_id, room_name)
 
